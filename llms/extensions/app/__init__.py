@@ -11,9 +11,11 @@ from aiohttp import web
 
 from llms.db import count_tokens_approx
 
+from .branches import BranchService
 from .db import AppDB
 
 g_db = None
+g_branches = None
 
 
 def install(ctx):
@@ -31,6 +33,15 @@ def install(ctx):
 
     if not get_db():
         return
+
+    global g_branches
+    g_branches = BranchService(g_db)
+
+    def conflict_response():
+        return web.json_response(
+            {"errorCode": "Conflict", "message": "Thread was modified by another session"},
+            status=409,
+        )
 
     thread_fields = [
         "id",
@@ -58,6 +69,7 @@ def install(ctx):
         "ref",
         "contextTokens",
         "parentId",
+        "currentBranchId",
     ]
 
     def thread_dto(row):
@@ -78,6 +90,18 @@ def install(ctx):
 
     def request_dto(row):
         return row and g_db.to_dto(row, ["usage"])
+
+    def hydrate_thread_row(row, user=None):
+        if not row:
+            return None
+        thread_id = row["id"]
+        g_db.ensure_thread_branches(thread_id, user=user)
+        row = g_db.get_thread(thread_id, user=user)
+        branch_id = row.get("currentBranchId")
+        if branch_id:
+            messages = g_db.get_branch_messages(branch_id, user=user)
+            row["messages"] = json.dumps(messages)
+        return thread_dto(row)
 
     def prompt_to_title(prompt):
         return prompt[:100] + ("..." if len(prompt) > 100 else "") if prompt else None
@@ -110,19 +134,42 @@ def install(ctx):
 
     async def get_thread(request):
         id = request.match_info["id"]
-        row = g_db.get_thread(id, user=ctx.get_username(request))
-        return web.json_response(thread_dto(row) if row else "")
+        user = ctx.get_username(request)
+        row = g_db.get_thread(id, user=user)
+        dto = hydrate_thread_row(row, user=user)
+        return web.json_response(dto if dto else "")
 
     ctx.add_get("threads/{id}", get_thread)
 
     async def update_thread(request):
         thread = await request.json()
         id = request.match_info["id"]
-        update_count = await g_db.update_thread_async(id, thread, user=ctx.get_username(request))
+        user = ctx.get_username(request)
+
+        if g_branches.check_thread_conflict(id, thread.get("updatedAt"), user=user):
+            return conflict_response()
+
+        g_db.ensure_thread_branches(id, user=user)
+        current = g_db.get_thread(id, user=user)
+        if not current:
+            raise Exception("Thread not found")
+
+        branch_id = current.get("currentBranchId")
+        if branch_id and "messages" in thread:
+            messages = thread["messages"]
+            if isinstance(messages, str):
+                messages = json.loads(messages)
+            messages = timestamp_messages(messages)
+            g_branches.replace_branch_messages(id, branch_id, messages, user=user)
+            thread = {k: v for k, v in thread.items() if k != "messages"}
+            thread["messages"] = messages
+
+        update_count = await g_db.update_thread_async(id, thread, user=user)
         if update_count == 0:
             raise Exception("Thread not found")
-        row = g_db.get_thread(id, user=ctx.get_username(request))
-        return web.json_response(thread_dto(row) if row else "")
+        row = g_db.get_thread(id, user=user)
+        dto = hydrate_thread_row(row, user=user)
+        return web.json_response(dto if dto else "")
 
     ctx.add_patch("threads/{id}", update_thread)
 
@@ -143,13 +190,25 @@ def install(ctx):
             raise Exception("messages required")
 
         chat = await request.json()
+        user = ctx.get_username(request)
+        id = request.match_info["id"]
+
+        if g_branches.check_thread_conflict(id, chat.get("updatedAt"), user=user):
+            return conflict_response()
 
         messages = timestamp_messages(chat.get("messages", []))
         if len(messages) == 0:
             raise Exception("messages required")
 
-        id = request.match_info["id"]
-        thread = thread_dto(g_db.get_thread(id, user=ctx.get_username(request)))
+        thread_row = g_db.get_thread(id, user=user)
+        if not thread_row:
+            raise Exception("Thread not found")
+        g_db.ensure_thread_branches(id, user=user)
+        branch_id = thread_row.get("currentBranchId") or g_db.ensure_thread_branches(id, user=user)
+        if branch_id and messages:
+            g_branches.replace_branch_messages(id, branch_id, messages, user=user)
+
+        thread = hydrate_thread_row(g_db.get_thread(id, user=user), user=user)
         if not thread:
             raise Exception("Thread not found")
 
@@ -190,13 +249,12 @@ def install(ctx):
             if not title:
                 update_thread["title"] = title = prompt_to_title(ctx.last_user_prompt(chat))
 
-        user = ctx.get_username(request)
         await g_db.update_thread_async(
             id,
             update_thread,
             user=user,
         )
-        thread = thread_dto(g_db.get_thread(id, user=user))
+        thread = hydrate_thread_row(g_db.get_thread(id, user=user), user=user)
         if not thread:
             raise Exception("Thread not found")
 
@@ -911,6 +969,12 @@ def install(ctx):
 
         await asyncio.gather(*tasks)
 
+        if thread_id and not nohistory and messages:
+            thread_row = g_db.get_thread(thread_id, user=user)
+            branch_id = thread_row.get("currentBranchId") if thread_row else None
+            if branch_id:
+                g_branches.replace_branch_messages(thread_id, branch_id, messages, user=user)
+
         if thread_id and not nohistory:
             # Update thread costs from all thread requests
             thread_requests = g_db.query_requests({"threadId": thread_id}, user=user)
@@ -978,6 +1042,134 @@ def install(ctx):
             await asyncio.gather(*tasks)
 
     ctx.register_chat_error_filter(chat_error)
+
+    async def branch_create(request):
+        body = await request.json()
+        user = ctx.get_username(request)
+        result = g_branches.create_branch(
+            thread_id=int(body["threadId"]),
+            parent_message_timestamp=int(body["parentMessageId"]),
+            name=body.get("name", "branch"),
+            copy_mode=body.get("copyMode", "copy"),
+            user=user,
+        )
+        return web.json_response(result)
+
+    ctx.add_post("branches/create", branch_create)
+
+    async def branch_switch(request):
+        body = await request.json()
+        user = ctx.get_username(request)
+        if g_branches.check_thread_conflict(int(body["threadId"]), body.get("updatedAt"), user=user):
+            return conflict_response()
+        result = g_branches.switch_branch(
+            thread_id=int(body["threadId"]),
+            branch_id=int(body["branchId"]),
+            user=user,
+        )
+        return web.json_response(result)
+
+    ctx.add_post("branches/switch", branch_switch)
+
+    async def branch_tree(request):
+        thread_id = int(request.match_info["dialog_id"])
+        user = ctx.get_username(request)
+        return web.json_response(g_branches.get_branch_tree(thread_id, user=user))
+
+    ctx.add_get("branches/tree/{dialog_id}", branch_tree)
+
+    async def branch_delete(request):
+        branch_id = int(request.match_info["branch_id"])
+        user = ctx.get_username(request)
+        return web.json_response(g_branches.delete_branch(branch_id, user=user))
+
+    ctx.add_delete("branches/delete/{branch_id}", branch_delete)
+
+    async def branch_merge(request):
+        body = await request.json()
+        user = ctx.get_username(request)
+        return web.json_response(
+            g_branches.merge_branches(
+                int(body["sourceBranchId"]),
+                int(body["targetBranchId"]),
+                user=user,
+            )
+        )
+
+    ctx.add_post("branches/merge", branch_merge)
+
+    async def branch_diff(request):
+        user = ctx.get_username(request)
+        return web.json_response(
+            g_branches.branch_diff(
+                int(request.query["branchA"]),
+                int(request.query["branchB"]),
+                user=user,
+            )
+        )
+
+    ctx.add_get("branches/diff", branch_diff)
+
+    async def branch_fork(request):
+        thread_id = int(request.match_info["dialog_id"])
+        body = await request.json() if request.body_exists else {}
+        user = ctx.get_username(request)
+        branch_id = body.get("branchId")
+        result = await g_branches.fork_thread_async(
+            thread_id,
+            branch_id=int(branch_id) if branch_id else None,
+            user=user,
+        )
+        return web.json_response(result)
+
+    ctx.add_post("branches/fork/{dialog_id}", branch_fork)
+
+    async def branch_export(request):
+        branch_id = int(request.match_info["branch_id"])
+        user = ctx.get_username(request)
+        return web.json_response(g_branches.export_branch(branch_id, user=user))
+
+    ctx.add_post("branches/export/{branch_id}", branch_export)
+
+    async def branch_import(request):
+        body = await request.json()
+        user = ctx.get_username(request)
+        thread_id = body.get("threadId")
+        result = await g_branches.import_branch_async(body, thread_id=int(thread_id) if thread_id else None, user=user)
+        return web.json_response(result)
+
+    ctx.add_post("branches/import", branch_import)
+
+    async def branch_tags(request):
+        body = await request.json()
+        user = ctx.get_username(request)
+        return web.json_response(
+            g_branches.update_tags(
+                int(body["branchId"]),
+                add=body.get("add"),
+                remove=body.get("remove"),
+                user=user,
+            )
+        )
+
+    ctx.add_post("branches/tags", branch_tags)
+
+    async def branch_search(request):
+        user = ctx.get_username(request)
+        q = request.query.get("q", "")
+        take = int(request.query.get("take", "50"))
+        return web.json_response(g_branches.search_branches(q, user=user, take=take))
+
+    ctx.add_get("branches/search", branch_search)
+
+    async def branch_rename(request):
+        body = await request.json()
+        user = ctx.get_username(request)
+        return web.json_response(
+            g_branches.rename_branch(int(body["branchId"]), body["name"], user=user)
+        )
+
+    ctx.add_patch("branches/{branch_id}", branch_rename)
 
 
 __install__ = install

@@ -696,6 +696,35 @@ class BranchService:
 
         return {"messageId": message_id, "versionNumber": new_version, "message": message}
 
+    def replace_branch_messages(
+        self, thread_id: int, branch_id: int, messages: List[Dict[str, Any]], user=None
+    ) -> List[Dict[str, Any]]:
+        with self.db.create_writer_connection() as conn:
+            conn.execute("DELETE FROM message_relationship WHERE branchId = ?", (branch_id,))
+            conn.execute("DELETE FROM message_version WHERE branchId = ?", (branch_id,))
+            conn.execute("DELETE FROM message WHERE branchId = ?", (branch_id,))
+            root_id = self.db._migrate_thread_messages_to_branch(
+                conn, thread_id, branch_id, messages, user=user
+            )
+            if root_id:
+                conn.execute(
+                    "UPDATE branch SET rootMessageId = ? WHERE id = ?",
+                    (root_id, branch_id),
+                )
+            conn.commit()
+
+        self.db.sync_main_branch_messages_json(thread_id, branch_id, messages, user=user)
+        return messages
+
+    def check_thread_conflict(self, thread_id: int, expected_updated_at, user=None) -> bool:
+        """Return True if concurrent modification detected (caller should respond 409)."""
+        if expected_updated_at is None:
+            return False
+        current = self.db.get_thread_column(thread_id, "updatedAt", user=user)
+        if current is None:
+            return False
+        return str(current) != str(expected_updated_at)
+
     def append_message_to_branch(
         self, thread_id: int, branch_id: int, message: Dict[str, Any], user=None
     ) -> Dict[str, Any]:
