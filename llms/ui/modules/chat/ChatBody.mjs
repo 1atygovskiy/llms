@@ -1,5 +1,6 @@
 import { ref, computed, nextTick, watch, onMounted, onUnmounted, inject } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import { MessageContextMenu } from './ContextMenu.mjs'
 
 function tryParseJson(str) {
     try {
@@ -897,7 +898,9 @@ export const ChatBody = {
                                 v-for="message in currentThreadMessages"
                                 :key="message.timestamp"
                                 v-show="message.role !== 'tool' && !!(message.content || message.tool_calls?.length || message.images?.length || message.audios?.length)"
+                                :data-timestamp="message.timestamp"
                                 :data-role="message.role"
+                                @contextmenu.prevent="onMessageContextMenu($event, message)"
                                 :data-has-content="!!(typeof message.content === 'string' ? message.content?.trim() : message.content?.length)"
                                 :data-has-tools="!!message.tool_calls?.length"
                                 :data-tool-call-id="message.tool_call_id || undefined"
@@ -1099,8 +1102,10 @@ export const ChatBody = {
             <div v-if="$ai.hasAccess" :class="$ctx.cls('chat-input', 'flex-shrink-0 px-6 py-4 border-t ' + $styles.chromeBorder + ' ' + $styles.bgChat)">
                 <ChatPrompt :model="$chat.getSelectedModel()" />
             </div>
+            <MessageContextMenu ref="contextMenu" />
         </div>
     `,
+    components: { MessageContextMenu },
     setup() {
         const ctx = inject('ctx')
         const models = ctx.state.models
@@ -1120,7 +1125,12 @@ export const ChatBody = {
             return models.find(m => m.name === selectedModel.value) || models.find(m => m.id === selectedModel.value)
         })
         const messagesContainer = ref(null)
+        const contextMenu = ref(null)
         const copying = ref(null)
+
+        function onMessageContextMenu(event, message) {
+            contextMenu.value?.open?.(event, message)
+        }
 
         const resolveUrl = (url) => {
             if (url && url.startsWith('~')) {
@@ -1339,6 +1349,8 @@ export const ChatBody = {
             selectedModel,
             selectedModelObj,
             messagesContainer,
+            contextMenu,
+            onMessageContextMenu,
             copying,
             copyMessageContent,
             redoMessage,

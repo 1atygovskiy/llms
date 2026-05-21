@@ -4,6 +4,8 @@ import { appendQueryString } from '@servicestack/client'
 import ThreadStore from './threadStore.mjs'
 import BranchStore from './branchStore.mjs'
 import Recents from './Recents.mjs'
+import BranchPanel from '../../ui/components/BranchPanel.mjs'
+import BranchTree from '../../ui/components/BranchTree.mjs'
 
 let ext
 
@@ -309,6 +311,8 @@ export default {
             ThreadItem,
             GroupedThreads,
             Recents,
+            BranchPanel,
+            BranchTree,
         })
         ctx.routes.push(...[
             { path: '/recents', component: Recents },

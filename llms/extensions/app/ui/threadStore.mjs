@@ -234,6 +234,10 @@ async function setCurrentThread(threadId) {
     const thread = await getThread(threadId)
     if (thread) {
         currentThread.value = thread
+        if (globalThis.$branches) {
+            await globalThis.$branches.loadBranchTree(threadId)
+            globalThis.$branches.currentBranchId.value = thread.currentBranchId ?? null
+        }
         startWatchingThread()
     }
     return thread

@@ -17,25 +17,23 @@ export const MessageContextMenu = {
                 @click="rewind">Rewind to branch start</button>
         </div>
     `,
-    props: {
-        message: { type: Object, default: null },
-    },
     emits: ['close'],
-    setup(props, { emit }) {
+    setup(props, { emit, expose }) {
         const visible = ref(false)
         const x = ref(0)
         const y = ref(0)
-        const compareBranchId = ref(null)
+        const activeMessage = ref(null)
         const branches = globalThis.$branches
         const ctx = globalThis.$ctx
 
-        function open(event, message, branchId = null) {
+        function open(event, message) {
             x.value = event.clientX
             y.value = event.clientY
             visible.value = true
-            compareBranchId.value = branchId
-            Object.assign(props, { message })
+            activeMessage.value = message
         }
+
+        expose({ open })
 
         function close() {
             visible.value = false
@@ -44,7 +42,7 @@ export const MessageContextMenu = {
 
         async function createBranch(copyMode) {
             const thread = ctx?.threads?.currentThread?.value
-            const msg = props.message
+            const msg = activeMessage.value
             if (!thread || !msg?.timestamp) return close()
             const name = `branch-${Date.now()}`
             await branches.createBranch({
@@ -57,11 +55,11 @@ export const MessageContextMenu = {
         }
 
         async function openDiff() {
-            const thread = ctx?.threads?.currentThread?.value
-            const bid = compareBranchId.value || branches?.currentBranchId?.value
-            const other = branches?.currentBranchId?.value
-            if (bid && other && bid !== other) {
-                await branches.getBranchDiff(bid, other)
+            const tree = branches?.currentBranchTree?.value
+            const currentId = branches?.currentBranchId?.value
+            const parentId = tree?.branches?.[0]?.parentBranchId
+            if (parentId && currentId && parentId !== currentId) {
+                await branches.getBranchDiff(parentId, currentId)
                 ctx.openModal('DiffViewer')
             }
             close()

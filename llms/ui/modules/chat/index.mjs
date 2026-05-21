@@ -1,4 +1,9 @@
 import { ref, watch, computed, nextTick, inject, onMounted, onUnmounted } from 'vue'
+import BranchIndicator from './BranchIndicator.mjs'
+import { MessageContextMenu } from './ContextMenu.mjs'
+import BranchPanel from '../../components/BranchPanel.mjs'
+import BranchTree from '../../components/BranchTree.mjs'
+import DiffViewer from '../../components/DiffViewer.mjs'
 import { $$, createElement, lastRightPart, ApiResult, createErrorStatus } from "@servicestack/client"
 import SettingsDialog, { useSettings } from './SettingsDialog.mjs'
 import {
@@ -452,6 +457,12 @@ export function useChatPrompt(ctx) {
             console.debug(`thread title is '${thread.title}'`, request.title)
         }
 
+        const branchId = globalThis.$branches?.currentBranchId?.value
+        if (branchId) {
+            globalThis.$branches?.markDirty(branchId)
+        }
+
+        request.updatedAt = thread.updatedAt
         const api = await ctx.threads.queueChat({ request, thread, model })
         if (api.response) {
             // success
@@ -459,10 +470,20 @@ export function useChatPrompt(ctx) {
             attachedFiles.value = []
             thread = api.response
             ctx.threads.replaceThread(thread)
+            if (branchId) {
+                globalThis.$branches?.clearDirty(branchId)
+            }
         } else {
             ctx.setError(api.error)
         }
     }
+
+    watch(messageText, (text) => {
+        const branchId = globalThis.$branches?.currentBranchId?.value
+        if (text?.trim() && branchId && ctx.threads.currentThread.value) {
+            globalThis.$branches?.markDirty(branchId)
+        }
+    })
 
     return {
         completion,
@@ -1270,11 +1291,17 @@ export default {
     /**@param {AppContext} ctx */
     install(ctx) {
         const Home = ChatBody
+        ctx.modals({ DiffViewer })
         ctx.components({
             SettingsDialog,
             ChatPrompt,
             VoiceInput,
             ErrorBubble,
+            BranchIndicator,
+            BranchPanel,
+            BranchTree,
+            MessageContextMenu,
+            DiffViewer,
 
             ChatBody,
             MessageUsage,
@@ -1314,7 +1341,43 @@ export default {
                 isActive({ path }) {
                     return path === '/' || path.startsWith('/c/')
                 }
-            }
+            },
+            branches: {
+                title: 'Branches',
+                component: {
+                    template: `<svg @click="toggle" class="size-7 p-1 cursor-pointer block rounded" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v12"/><circle cx="6" cy="18" r="3"/><path d="M18 6v9"/><circle cx="18" cy="18" r="3"/></svg>`,
+                    setup() {
+                        return {
+                            toggle() {
+                                const showing = ctx.layout.left === 'BranchPanel'
+                                ctx.setLayout({ left: showing ? 'ThreadsSidebar' : 'BranchPanel' })
+                                if (!showing) ctx.toggleLayout('left', true)
+                            },
+                        }
+                    },
+                },
+                isActive({ left }) {
+                    return left === 'BranchPanel' || left === 'BranchTree'
+                },
+            },
+            branchMap: {
+                title: 'Branch map',
+                component: {
+                    template: `<svg @click="toggle" class="size-7 p-1 cursor-pointer block rounded" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>`,
+                    setup() {
+                        return {
+                            toggle() {
+                                const showing = ctx.layout.left === 'BranchTree'
+                                ctx.setLayout({ left: showing ? 'ThreadsSidebar' : 'BranchTree' })
+                                if (!showing) ctx.toggleLayout('left', true)
+                            },
+                        }
+                    },
+                },
+                isActive({ left }) {
+                    return left === 'BranchTree'
+                },
+            },
         })
 
         const title = 'Chat'
@@ -1329,6 +1392,10 @@ export default {
         ])
 
         ctx.setThreadHeaders({
+            branch: {
+                component: BranchIndicator,
+                show({ thread }) { return !!thread?.id }
+            },
             model: {
                 component: ThreadModel,
                 show({ thread }) { return thread.model }

@@ -198,6 +198,14 @@ export class AppContext {
             markdown: this.renderMarkdown.bind(this),
             content: this.renderContent.bind(this),
         })
+        this.initBranchLayout()
+    }
+
+    initBranchLayout() {
+        if (!this.components('BranchPanel')) return
+        if (!this.layout.left) {
+            this.layout.left = 'ThreadsSidebar'
+        }
     }
     setGlobals(globals) {
         Object.entries(globals).forEach(([name, global]) => {
