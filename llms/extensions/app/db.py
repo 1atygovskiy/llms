@@ -6,6 +6,18 @@ from typing import Any, Dict
 
 from llms.db import DbManager, count_tokens_approx, order_by, select_columns, to_dto, valid_columns
 
+DEFAULT_BRANCH_NAME = "main"
+DEFAULT_BRANCH_TAG = "__default__"
+
+MESSAGE_DTO_JSON_COLUMNS = [
+    "content",
+    "toolCalls",
+    "usage",
+    "images",
+    "audios",
+    "metadata",
+]
+
 
 def with_user(data, user):
     if user is None:
@@ -60,6 +72,48 @@ class AppDB:
                 "providerResponse": "JSON",
                 "contextTokens": "INTEGER",
                 "parentId": "INTEGER",
+                "currentBranchId": "INTEGER",
+            },
+            "branch": {
+                "id": "INTEGER",
+                "threadId": "INTEGER",
+                "user": "TEXT",
+                "name": "TEXT",
+                "parentBranchId": "INTEGER",
+                "rootMessageId": "INTEGER",
+                "createdAt": "TIMESTAMP",
+                "tags": "JSON",
+                "isDeleted": "INTEGER",
+            },
+            "message": {
+                "id": "INTEGER",
+                "threadId": "INTEGER",
+                "branchId": "INTEGER",
+                "versionNumber": "INTEGER",
+                "timestamp": "INTEGER",
+                "role": "TEXT",
+                "content": "JSON",
+                "model": "TEXT",
+                "toolCalls": "JSON",
+                "toolCallId": "TEXT",
+                "usage": "JSON",
+                "images": "JSON",
+                "audios": "JSON",
+                "metadata": "JSON",
+            },
+            "message_version": {
+                "id": "INTEGER",
+                "branchId": "INTEGER",
+                "messageId": "INTEGER",
+                "versionNumber": "INTEGER",
+                "createdAt": "TIMESTAMP",
+                "snapshot": "JSON",
+            },
+            "message_relationship": {
+                "parentMessageId": "INTEGER",
+                "childMessageId": "INTEGER",
+                "branchId": "INTEGER",
+                "relationType": "TEXT",
             },
             "request": {
                 "id": "INTEGER",
@@ -152,9 +206,301 @@ class AppDB:
         self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_request_cost ON request(cost)")
         self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_request_threadid ON request(threadId)")
 
+        self.init_branch_tables(conn)
+
+    def init_branch_tables(self, conn):
+        overrides = {
+            "id": "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "createdAt": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+            "isDeleted": "INTEGER DEFAULT 0",
+            "versionNumber": "INTEGER DEFAULT 1",
+        }
+
+        branch_columns = ",".join(
+            [f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["branch"].items()]
+        )
+        self.db.exec(
+            conn,
+            f"""
+            CREATE TABLE IF NOT EXISTS branch (
+                {branch_columns}
+            )
+            """,
+        )
+        self.add_missing_columns(conn, "branch")
+        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_branch_threadid ON branch(threadId)")
+        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_branch_parent ON branch(parentBranchId)")
+
+        message_columns = ",".join(
+            [f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["message"].items()]
+        )
+        self.db.exec(
+            conn,
+            f"""
+            CREATE TABLE IF NOT EXISTS message (
+                {message_columns},
+                UNIQUE(threadId, branchId, timestamp)
+            )
+            """,
+        )
+        self.add_missing_columns(conn, "message")
+        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_message_branch ON message(branchId, timestamp)")
+
+        version_columns = ",".join(
+            [f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["message_version"].items()]
+        )
+        self.db.exec(
+            conn,
+            f"""
+            CREATE TABLE IF NOT EXISTS message_version (
+                {version_columns}
+            )
+            """,
+        )
+        self.add_missing_columns(conn, "message_version")
+        self.db.exec(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_message_version_message ON message_version(messageId, versionNumber)",
+        )
+
+        rel_columns = ",".join(
+            [f"{col} {dtype}" for col, dtype in self.columns["message_relationship"].items()]
+        )
+        self.db.exec(
+            conn,
+            f"""
+            CREATE TABLE IF NOT EXISTS message_relationship (
+                {rel_columns},
+                PRIMARY KEY (parentMessageId, childMessageId, branchId)
+            )
+            """,
+        )
+        self.add_missing_columns(conn, "message_relationship")
+
+    def _parse_thread_messages(self, messages_value):
+        if not messages_value:
+            return []
+        if isinstance(messages_value, list):
+            return messages_value
+        if isinstance(messages_value, str):
+            try:
+                return json.loads(messages_value)
+            except json.JSONDecodeError:
+                return []
+        return []
+
+    def _message_dict_to_row(self, thread_id, branch_id, message):
+        row = {
+            "threadId": thread_id,
+            "branchId": branch_id,
+            "versionNumber": message.get("versionNumber") or message.get("version_number") or 1,
+            "timestamp": message.get("timestamp"),
+            "role": message.get("role"),
+            "content": message.get("content"),
+            "model": message.get("model"),
+            "toolCalls": message.get("tool_calls") or message.get("toolCalls"),
+            "toolCallId": message.get("tool_call_id") or message.get("toolCallId"),
+            "usage": message.get("usage"),
+            "images": message.get("images"),
+            "audios": message.get("audios"),
+            "metadata": message.get("metadata"),
+        }
+        return row
+
+    def _insert_message_row(self, conn, row):
+        columns = self.columns["message"]
+        required = ["threadId", "branchId", "timestamp", "role"]
+        insert_keys = required + [
+            k
+            for k in columns
+            if k not in ("id",) and k not in required and row.get(k) is not None
+        ]
+
+        values = []
+        for key in insert_keys:
+            val = row.get(key)
+            if columns[key] == "JSON" and val is not None and not isinstance(val, str):
+                val = json.dumps(val)
+            values.append(val)
+
+        sql = f"INSERT INTO message ({', '.join(insert_keys)}) VALUES ({', '.join(['?'] * len(insert_keys))})"
+        return conn.execute(sql, values).lastrowid
+
+    def _insert_message_version(self, conn, branch_id, message_id, version_number, snapshot):
+        conn.execute(
+            """
+            INSERT INTO message_version (branchId, messageId, versionNumber, createdAt, snapshot)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                branch_id,
+                message_id,
+                version_number,
+                datetime.now().isoformat(" "),
+                json.dumps(snapshot),
+            ),
+        )
+
+    def _link_messages_sequence(self, conn, branch_id, parent_message_id, child_message_id):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO message_relationship
+                (parentMessageId, childMessageId, branchId, relationType)
+            VALUES (?, ?, ?, 'sequence')
+            """,
+            (parent_message_id, child_message_id, branch_id),
+        )
+
+    def _migrate_thread_messages_to_branch(self, conn, thread_id, branch_id, messages, user=None):
+        root_message_id = None
+        prev_message_id = None
+        initial_timestamp = int(time.time() * 1000) + 1
+
+        for idx, message in enumerate(messages):
+            if "timestamp" not in message:
+                message["timestamp"] = initial_timestamp + idx
+            row = self._message_dict_to_row(thread_id, branch_id, message)
+            message_id = self._insert_message_row(conn, row)
+            snapshot = dict(message)
+            self._insert_message_version(conn, branch_id, message_id, row["versionNumber"], snapshot)
+            if root_message_id is None:
+                root_message_id = message_id
+            if prev_message_id is not None:
+                self._link_messages_sequence(conn, branch_id, prev_message_id, message_id)
+            prev_message_id = message_id
+
+        if root_message_id is not None:
+            conn.execute(
+                "UPDATE branch SET rootMessageId = ? WHERE id = ?",
+                (root_message_id, branch_id),
+            )
+        return root_message_id
+
+    def ensure_thread_branches(self, thread_id, user=None):
+        """
+        Lazy migration: ensure thread has a default main branch and normalized messages.
+        Dual-write: thread.messages JSON is left unchanged for legacy clients.
+        """
+        thread = self.get_thread(thread_id, user=user)
+        if not thread:
+            return None
+
+        if thread.get("currentBranchId"):
+            return thread["currentBranchId"]
+
+        with self.create_writer_connection() as conn:
+            existing = conn.execute(
+                """
+                SELECT id FROM branch
+                WHERE threadId = ? AND isDeleted = 0
+                ORDER BY id ASC LIMIT 1
+                """,
+                (thread_id,),
+            ).fetchone()
+
+            if existing:
+                branch_id = existing[0]
+                conn.execute(
+                    "UPDATE thread SET currentBranchId = ? WHERE id = ?",
+                    (branch_id, thread_id),
+                )
+                conn.commit()
+                return branch_id
+
+            now = datetime.now().isoformat(" ")
+            branch_user = thread.get("user") if user is None else user
+            cursor = conn.execute(
+                """
+                INSERT INTO branch (threadId, user, name, parentBranchId, rootMessageId, createdAt, tags, isDeleted)
+                VALUES (?, ?, ?, NULL, NULL, ?, ?, 0)
+                """,
+                (
+                    thread_id,
+                    branch_user,
+                    DEFAULT_BRANCH_NAME,
+                    now,
+                    json.dumps([DEFAULT_BRANCH_TAG]),
+                ),
+            )
+            branch_id = cursor.lastrowid
+
+            messages = self._parse_thread_messages(thread.get("messages"))
+            if messages:
+                self._migrate_thread_messages_to_branch(conn, thread_id, branch_id, messages, user=user)
+
+            conn.execute(
+                "UPDATE thread SET currentBranchId = ? WHERE id = ?",
+                (branch_id, thread_id),
+            )
+            conn.commit()
+            return branch_id
+
+    def get_branch_messages(self, branch_id, user=None):
+        """Load messages for a branch ordered by timestamp."""
+        rows = self.db.all(
+            """
+            SELECT * FROM message
+            WHERE branchId = :branch_id
+            ORDER BY timestamp ASC
+            """,
+            {"branch_id": branch_id},
+        )
+        messages = []
+        for row in rows:
+            dto = self.to_dto(row, MESSAGE_DTO_JSON_COLUMNS)
+            message = {
+                "timestamp": dto.get("timestamp"),
+                "role": dto.get("role"),
+                "content": dto.get("content"),
+            }
+            if dto.get("model"):
+                message["model"] = dto["model"]
+            if dto.get("toolCalls"):
+                message["tool_calls"] = dto["toolCalls"]
+            if dto.get("toolCallId"):
+                message["tool_call_id"] = dto["toolCallId"]
+            if dto.get("usage"):
+                message["usage"] = dto["usage"]
+            if dto.get("images"):
+                message["images"] = dto["images"]
+            if dto.get("audios"):
+                message["audios"] = dto["audios"]
+            if dto.get("metadata"):
+                message["metadata"] = dto["metadata"]
+            if dto.get("versionNumber"):
+                message["versionNumber"] = dto["versionNumber"]
+            message["id"] = dto.get("id")
+            messages.append(message)
+        return messages
+
+    def sync_main_branch_messages_json(self, thread_id, branch_id, messages, user=None):
+        """Dual-write thread.messages JSON for the default main branch only."""
+        branch = self.db.one(
+            "SELECT name, tags FROM branch WHERE id = :id",
+            {"id": branch_id},
+        )
+        if not branch:
+            return
+        tags = branch.get("tags")
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except json.JSONDecodeError:
+                tags = []
+        is_main = branch.get("name") == DEFAULT_BRANCH_NAME or (
+            isinstance(tags, list) and DEFAULT_BRANCH_TAG in tags
+        )
+        if not is_main:
+            return
+        self.update_thread(thread_id, {"messages": messages}, user=user)
+
     def import_db(self, threads, requests):
         self.ctx.log("import threads and requests")
         with self.create_writer_connection() as conn:
+            conn.execute("DROP TABLE IF EXISTS message_relationship")
+            conn.execute("DROP TABLE IF EXISTS message_version")
+            conn.execute("DROP TABLE IF EXISTS message")
+            conn.execute("DROP TABLE IF EXISTS branch")
             conn.execute("DROP TABLE IF EXISTS thread")
             conn.execute("DROP TABLE IF EXISTS request")
             self.init_db(conn)
