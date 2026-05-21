@@ -11,6 +11,7 @@ sqlite3.register_adapter(datetime, lambda val: val.isoformat(" "))
 sqlite3.register_converter("timestamp", lambda val: datetime.fromisoformat(val.decode()))
 
 POOL = os.getenv("LLMS_POOL", "0") == "1"
+SYNC_WRITES = os.getenv("LLMS_SYNC", "0") == "1"
 
 
 def create_reader_connection(db_path):
@@ -217,8 +218,13 @@ class DbManager:
         if not clone:
             self.task_queue = Queue()
             self.stop_event = Event()
-            self.writer_thread = Thread(target=writer_thread, args=(ctx, db_path, self.task_queue, self.stop_event))
-            self.writer_thread.start()
+            if SYNC_WRITES:
+                self.writer_thread = None
+            else:
+                self.writer_thread = Thread(
+                    target=writer_thread, args=(ctx, db_path, self.task_queue, self.stop_event)
+                )
+                self.writer_thread.start()
         else:
             # share singleton writer thread in clones
             self.task_queue = clone.task_queue
@@ -260,6 +266,20 @@ class DbManager:
                 - rowcount (int): output of cursor.rowcount
                 - error (Exception): exception if operation failed, else None
         """
+        if SYNC_WRITES:
+            conn = create_writer_connection(self.db_path)
+            try:
+                cursor = conn.execute(query, args or ())
+                conn.commit()
+                if callback:
+                    callback(cursor.lastrowid, cursor.rowcount)
+            except sqlite3.Error as e:
+                self.ctx.err("sync_write", e)
+                if callback:
+                    callback(None, None, error=e)
+            finally:
+                conn.close()
+            return
         self.task_queue.put((query, args, callback))
 
     def log_sql(self, sql, parameters=None):
@@ -439,8 +459,9 @@ class DbManager:
     def close(self):
         self.ctx.dbg("Closing database")
         self.stop_event.set()
-        self.task_queue.put(None)  # Poison pill to signal shutdown
-        self.writer_thread.join()
+        if self.writer_thread:
+            self.task_queue.put(None)  # Poison pill to signal shutdown
+            self.writer_thread.join()
 
         while not self.read_only_pool.empty():
             try:

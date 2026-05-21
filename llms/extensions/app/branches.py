@@ -84,15 +84,17 @@ class BranchService:
             sql += " AND timestamp <= :timestamp"
             params["timestamp"] = up_to_timestamp
         sql += " ORDER BY timestamp ASC"
+        import sqlite3
+
+        conn.row_factory = sqlite3.Row
         rows = conn.execute(sql, params).fetchall()
-        colnames = list(self.db.columns["message"].keys())
 
         id_map = {}
         root_message_id = None
         prev_new_id = None
 
         for row in rows:
-            row_dict = {colnames[i]: row[i] for i in range(len(colnames))}
+            row_dict = dict(row)
             source_id = row_dict["id"]
             message = self._row_to_message_dict(row_dict)
             new_id = self.db._insert_message_row(
