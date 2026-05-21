@@ -2,6 +2,7 @@ import { onMounted, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { appendQueryString } from '@servicestack/client'
 import ThreadStore from './threadStore.mjs'
+import BranchStore from './branchStore.mjs'
 import Recents from './Recents.mjs'
 
 let ext
@@ -313,6 +314,7 @@ export default {
             { path: '/recents', component: Recents },
         ])
         ThreadStore.install(ctx)
+        BranchStore.install(ctx)
 
         ctx.setGlobals({
             requests: useRequests(ext)
