@@ -4,7 +4,15 @@ import time
 from datetime import datetime, timedelta
 from typing import Any, Dict
 
-from llms.db import DbManager, count_tokens_approx, order_by, select_columns, to_dto, valid_columns
+from llms.db import (
+    DbManager,
+    count_tokens_approx,
+    create_writer_connection,
+    order_by,
+    select_columns,
+    to_dto,
+    valid_columns,
+)
 
 DEFAULT_BRANCH_NAME = "main"
 DEFAULT_BRANCH_TAG = "__default__"
@@ -41,7 +49,6 @@ class AppDB:
         if dirname:
             os.makedirs(dirname, exist_ok=True)
 
-        self.db = DbManager(ctx, self.db_path)
         self.columns = {
             "thread": {
                 "id": "INTEGER",
@@ -143,8 +150,22 @@ class AppDB:
                 "ref": "TEXT",
             },
         }
-        with self.create_writer_connection() as conn:
+        # Initialize schema before the background writer thread opens the database.
+        conn = create_writer_connection(self.db_path)
+        try:
             self.init_db(conn)
+        finally:
+            conn.close()
+
+        self.db = DbManager(ctx, self.db_path)
+
+    def exec_conn(self, conn, sql, parameters=None):
+        """Execute SQL on a connection (works before DbManager is created)."""
+        if self.ctx.debug:
+            self.ctx.dbg(
+                "SQL>" + ("\n" if "\n" in sql else " ") + sql + ("\n" if parameters else " ") + str(parameters)
+            )
+        return conn.execute(sql, parameters or ())
 
     def get_connection(self):
         return self.create_reader_connection()
@@ -157,13 +178,13 @@ class AppDB:
 
     # Check for missing columns and migrate if necessary
     def add_missing_columns(self, conn, table):
-        cur = self.db.exec(conn, f"PRAGMA table_info({table})")
+        cur = self.exec_conn(conn, f"PRAGMA table_info({table})")
         columns = {row[1] for row in cur.fetchall()}
 
         for col, dtype in self.columns[table].items():
             if col not in columns:
                 try:
-                    self.db.exec(conn, f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
+                    self.exec_conn(conn, f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
                 except Exception as e:
                     self.ctx.err(f"adding {table} column {col}", e)
 
@@ -176,7 +197,7 @@ class AppDB:
             "updatedAt": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         }
         sql_columns = ",".join([f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["thread"].items()])
-        self.db.exec(
+        self.exec_conn(
             conn,
             f"""
             CREATE TABLE IF NOT EXISTS thread (
@@ -185,14 +206,14 @@ class AppDB:
             """,
         )
         self.add_missing_columns(conn, "thread")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_thread_user ON thread(user)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_thread_createdat ON thread(createdAt)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_thread_updatedat ON thread(updatedAt)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_thread_model ON thread(model)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_thread_cost ON thread(cost)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_thread_user ON thread(user)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_thread_createdat ON thread(createdAt)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_thread_updatedat ON thread(updatedAt)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_thread_model ON thread(model)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_thread_cost ON thread(cost)")
 
         sql_columns = ",".join([f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["request"].items()])
-        self.db.exec(
+        self.exec_conn(
             conn,
             f"""
             CREATE TABLE IF NOT EXISTS request (
@@ -201,10 +222,10 @@ class AppDB:
             """,
         )
         self.add_missing_columns(conn, "request")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_request_user ON request(user)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_request_createdat ON request(createdAt)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_request_cost ON request(cost)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_request_threadid ON request(threadId)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_request_user ON request(user)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_request_createdat ON request(createdAt)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_request_cost ON request(cost)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_request_threadid ON request(threadId)")
 
         self.init_branch_tables(conn)
 
@@ -219,7 +240,7 @@ class AppDB:
         branch_columns = ",".join(
             [f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["branch"].items()]
         )
-        self.db.exec(
+        self.exec_conn(
             conn,
             f"""
             CREATE TABLE IF NOT EXISTS branch (
@@ -228,13 +249,13 @@ class AppDB:
             """,
         )
         self.add_missing_columns(conn, "branch")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_branch_threadid ON branch(threadId)")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_branch_parent ON branch(parentBranchId)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_branch_threadid ON branch(threadId)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_branch_parent ON branch(parentBranchId)")
 
         message_columns = ",".join(
             [f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["message"].items()]
         )
-        self.db.exec(
+        self.exec_conn(
             conn,
             f"""
             CREATE TABLE IF NOT EXISTS message (
@@ -244,12 +265,12 @@ class AppDB:
             """,
         )
         self.add_missing_columns(conn, "message")
-        self.db.exec(conn, "CREATE INDEX IF NOT EXISTS idx_message_branch ON message(branchId, timestamp)")
+        self.exec_conn(conn, "CREATE INDEX IF NOT EXISTS idx_message_branch ON message(branchId, timestamp)")
 
         version_columns = ",".join(
             [f"{col} {overrides.get(col, dtype)}" for col, dtype in self.columns["message_version"].items()]
         )
-        self.db.exec(
+        self.exec_conn(
             conn,
             f"""
             CREATE TABLE IF NOT EXISTS message_version (
@@ -258,7 +279,7 @@ class AppDB:
             """,
         )
         self.add_missing_columns(conn, "message_version")
-        self.db.exec(
+        self.exec_conn(
             conn,
             "CREATE INDEX IF NOT EXISTS idx_message_version_message ON message_version(messageId, versionNumber)",
         )
@@ -266,7 +287,7 @@ class AppDB:
         rel_columns = ",".join(
             [f"{col} {dtype}" for col, dtype in self.columns["message_relationship"].items()]
         )
-        self.db.exec(
+        self.exec_conn(
             conn,
             f"""
             CREATE TABLE IF NOT EXISTS message_relationship (
@@ -385,59 +406,105 @@ class AppDB:
         if not thread:
             return None
 
-        if thread.get("currentBranchId"):
-            return thread["currentBranchId"]
-
         with self.create_writer_connection() as conn:
-            existing = conn.execute(
-                """
-                SELECT id FROM branch
-                WHERE threadId = ? AND isDeleted = 0
-                ORDER BY id ASC LIMIT 1
-                """,
-                (thread_id,),
-            ).fetchone()
+            branch_id = thread.get("currentBranchId")
 
-            if existing:
-                branch_id = existing[0]
-                conn.execute(
-                    "UPDATE thread SET currentBranchId = ? WHERE id = ?",
-                    (branch_id, thread_id),
-                )
-                conn.commit()
-                return branch_id
+            if not branch_id:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM branch
+                    WHERE threadId = ? AND isDeleted = 0
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (thread_id,),
+                ).fetchone()
 
-            now = datetime.now().isoformat(" ")
-            branch_user = thread.get("user") if user is None else user
-            cursor = conn.execute(
-                """
-                INSERT INTO branch (threadId, user, name, parentBranchId, rootMessageId, createdAt, tags, isDeleted)
-                VALUES (?, ?, ?, NULL, NULL, ?, ?, 0)
-                """,
-                (
-                    thread_id,
-                    branch_user,
-                    DEFAULT_BRANCH_NAME,
-                    now,
-                    json.dumps([DEFAULT_BRANCH_TAG]),
-                ),
-            )
-            branch_id = cursor.lastrowid
+                if existing:
+                    branch_id = existing[0]
+                    conn.execute(
+                        "UPDATE thread SET currentBranchId = ? WHERE id = ?",
+                        (branch_id, thread_id),
+                    )
+                else:
+                    now = datetime.now().isoformat(" ")
+                    branch_user = thread.get("user") if user is None else user
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO branch (threadId, user, name, parentBranchId, rootMessageId, createdAt, tags, isDeleted)
+                        VALUES (?, ?, ?, NULL, NULL, ?, ?, 0)
+                        """,
+                        (
+                            thread_id,
+                            branch_user,
+                            DEFAULT_BRANCH_NAME,
+                            now,
+                            json.dumps([DEFAULT_BRANCH_TAG]),
+                        ),
+                    )
+                    branch_id = cursor.lastrowid
+                    conn.execute(
+                        "UPDATE thread SET currentBranchId = ? WHERE id = ?",
+                        (branch_id, thread_id),
+                    )
 
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM message WHERE branchId = ?",
+                (branch_id,),
+            ).fetchone()[0]
             messages = self._parse_thread_messages(thread.get("messages"))
-            if messages:
+            if message_count == 0 and messages:
                 self._migrate_thread_messages_to_branch(conn, thread_id, branch_id, messages, user=user)
 
-            conn.execute(
-                "UPDATE thread SET currentBranchId = ? WHERE id = ?",
-                (branch_id, thread_id),
-            )
             conn.commit()
             return branch_id
 
+    def _chat_message_from_row(self, row):
+        dto = self.to_dto(row, MESSAGE_DTO_JSON_COLUMNS)
+        message = {
+            "timestamp": dto.get("timestamp"),
+            "role": dto.get("role"),
+            "content": dto.get("content"),
+        }
+        if dto.get("model"):
+            message["model"] = dto["model"]
+        if dto.get("toolCalls"):
+            message["tool_calls"] = dto["toolCalls"]
+        if dto.get("toolCallId"):
+            message["tool_call_id"] = dto["toolCallId"]
+        if dto.get("usage"):
+            message["usage"] = dto["usage"]
+        if dto.get("images"):
+            message["images"] = dto["images"]
+        if dto.get("audios"):
+            message["audios"] = dto["audios"]
+        if dto.get("metadata"):
+            message["metadata"] = dto["metadata"]
+        if dto.get("versionNumber"):
+            message["versionNumber"] = dto["versionNumber"]
+        if dto.get("id"):
+            message["id"] = dto["id"]
+        return message
+
     def get_branch_messages(self, branch_id, user=None):
-        """Load messages for a branch ordered by timestamp."""
-        rows = self.db.all(
+        """Load messages for a branch (owned rows + referenced rows for link branches)."""
+        by_timestamp = {}
+
+        ref_rows = self.db.all(
+            """
+            SELECT m.* FROM message m
+            INNER JOIN message_relationship mr ON mr.childMessageId = m.id
+            WHERE mr.branchId = :branch_id
+            GROUP BY m.id
+            ORDER BY m.timestamp ASC
+            """,
+            {"branch_id": branch_id},
+        )
+        for row in ref_rows:
+            message = self._chat_message_from_row(row)
+            if message.get("timestamp") is not None:
+                by_timestamp[message["timestamp"]] = message
+
+        own_rows = self.db.all(
             """
             SELECT * FROM message
             WHERE branchId = :branch_id
@@ -445,33 +512,12 @@ class AppDB:
             """,
             {"branch_id": branch_id},
         )
-        messages = []
-        for row in rows:
-            dto = self.to_dto(row, MESSAGE_DTO_JSON_COLUMNS)
-            message = {
-                "timestamp": dto.get("timestamp"),
-                "role": dto.get("role"),
-                "content": dto.get("content"),
-            }
-            if dto.get("model"):
-                message["model"] = dto["model"]
-            if dto.get("toolCalls"):
-                message["tool_calls"] = dto["toolCalls"]
-            if dto.get("toolCallId"):
-                message["tool_call_id"] = dto["toolCallId"]
-            if dto.get("usage"):
-                message["usage"] = dto["usage"]
-            if dto.get("images"):
-                message["images"] = dto["images"]
-            if dto.get("audios"):
-                message["audios"] = dto["audios"]
-            if dto.get("metadata"):
-                message["metadata"] = dto["metadata"]
-            if dto.get("versionNumber"):
-                message["versionNumber"] = dto["versionNumber"]
-            message["id"] = dto.get("id")
-            messages.append(message)
-        return messages
+        for row in own_rows:
+            message = self._chat_message_from_row(row)
+            if message.get("timestamp") is not None:
+                by_timestamp[message["timestamp"]] = message
+
+        return [by_timestamp[ts] for ts in sorted(by_timestamp.keys())]
 
     def sync_main_branch_messages_json(self, thread_id, branch_id, messages, user=None):
         """Dual-write thread.messages JSON for the default main branch only."""

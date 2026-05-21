@@ -12,6 +12,27 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# 1b. Create branch by message id (TZ messageId)
+def test_create_branch_by_message_id(temp_db, sample_thread):
+    db, branches = temp_db
+    db.ensure_thread_branches(sample_thread)
+    main_id = db.get_thread(sample_thread)["currentBranchId"]
+    row = db.db.one(
+        "SELECT id, timestamp FROM message WHERE threadId = :t AND branchId = :b AND timestamp = 1002",
+        {"t": sample_thread, "b": main_id},
+    )
+    assert row
+    result = branches.create_branch(
+        sample_thread,
+        None,
+        "by-id",
+        copy_mode="copy",
+        parent_message_id=row["id"],
+    )
+    assert result["branchId"]
+    assert len(result["messages"]) >= 3
+
+
 # 1. Create branch from message
 def test_create_branch_from_message(temp_db, sample_thread):
     db, branches = temp_db
@@ -33,8 +54,21 @@ def test_switch_branches(temp_db, sample_thread):
     alt_id = created["branchId"]
     switched = branches.switch_branch(sample_thread, main_id)
     assert switched["branchId"] == main_id
+    assert switched.get("updatedAt")
     back = branches.switch_branch(sample_thread, alt_id)
     assert back["branchId"] == alt_id
+    assert back.get("updatedAt")
+
+
+def test_switch_after_create_updates_thread(temp_db, sample_thread):
+    db, branches = temp_db
+    db.ensure_thread_branches(sample_thread)
+    main_id = db.get_thread(sample_thread)["currentBranchId"]
+    branches.create_branch(sample_thread, 1002, "alt2", copy_mode="copy")
+    switched = branches.switch_branch(sample_thread, main_id)
+    assert switched["branchId"] == main_id
+    assert switched.get("updatedAt")
+    assert db.get_thread(sample_thread)["currentBranchId"] == main_id
 
 
 # 3. Branch tree
@@ -224,13 +258,23 @@ def test_reference_mode_no_duplicate_rows(temp_db, sample_thread):
     db, branches = temp_db
     db.ensure_thread_branches(sample_thread)
     before = db.db.scalar("SELECT COUNT(*) FROM message WHERE threadId = :t", {"t": sample_thread})
-    branches.create_branch(sample_thread, 1002, "ref", copy_mode="reference")
+    created = branches.create_branch(sample_thread, 1002, "ref", copy_mode="reference")
     after = db.db.scalar("SELECT COUNT(*) FROM message WHERE threadId = :t", {"t": sample_thread})
     rels = db.db.scalar(
         "SELECT COUNT(*) FROM message_relationship WHERE relationType = 'reference'"
     )
     assert after == before
     assert rels >= 1
+    assert len(created["messages"]) >= 3
+
+
+def test_reference_branch_loads_messages(temp_db, sample_thread):
+    db, branches = temp_db
+    db.ensure_thread_branches(sample_thread)
+    created = branches.create_branch(sample_thread, 1002, "linked", copy_mode="reference")
+    loaded = db.get_branch_messages(created["branchId"])
+    assert len(loaded) >= 3
+    assert any(m.get("timestamp") == 1002 for m in loaded)
 
 
 # 25. Dual-write main branch

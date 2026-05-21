@@ -4,6 +4,7 @@ import { MessageContextMenu } from './ContextMenu.mjs'
 import BranchPanel from '../../components/BranchPanel.mjs'
 import BranchTree from '../../components/BranchTree.mjs'
 import DiffViewer from '../../components/DiffViewer.mjs'
+import BranchCompare from '../../components/BranchCompare.mjs'
 import { $$, createElement, lastRightPart, ApiResult, createErrorStatus } from "@servicestack/client"
 import SettingsDialog, { useSettings } from './SettingsDialog.mjs'
 import {
@@ -1291,7 +1292,7 @@ export default {
     /**@param {AppContext} ctx */
     install(ctx) {
         const Home = ChatBody
-        ctx.modals({ DiffViewer })
+        ctx.modals({ DiffViewer, BranchCompare })
         ctx.components({
             SettingsDialog,
             ChatPrompt,
@@ -1302,6 +1303,7 @@ export default {
             BranchTree,
             MessageContextMenu,
             DiffViewer,
+            BranchCompare,
 
             ChatBody,
             MessageUsage,

@@ -294,6 +294,7 @@ const SettingsPage = {
     `,
     setup() {
         const ctx = inject('ctx')
+        const ext = ctx.scope('app')
 
         const userUploading = ref(false)
         const userSuccess = ref(false)
@@ -314,7 +315,7 @@ const SettingsPage = {
                 const formData = new FormData()
                 formData.append('file', file)
 
-                const response = await ctx.postForm('/user/avatar', { body: formData })
+                const response = await ext.postForm('/user/avatar', { body: formData })
                 const result = await response.json()
 
                 if (response.ok && result.success) {
@@ -344,7 +345,7 @@ const SettingsPage = {
                 const formData = new FormData()
                 formData.append('file', file)
 
-                const response = await ctx.postForm('/agents/avatar', { body: formData })
+                const response = await ext.postForm('/agents/avatar', { body: formData })
                 const result = await response.json()
 
                 if (response.ok && result.success) {

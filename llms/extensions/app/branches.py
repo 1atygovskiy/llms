@@ -39,6 +39,34 @@ class BranchService:
     def _message_by_id(self, message_id):
         return self.db.db.one("SELECT * FROM message WHERE id = :id", {"id": message_id})
 
+    def _resolve_parent_message(
+        self,
+        thread_id: int,
+        branch_id: int,
+        *,
+        parent_message_id: Optional[int] = None,
+        parent_message_timestamp: Optional[int] = None,
+    ):
+        if parent_message_id is not None:
+            row = self.db.db.one(
+                """
+                SELECT * FROM message
+                WHERE threadId = :thread_id AND branchId = :branch_id AND id = :message_id
+                """,
+                {
+                    "thread_id": thread_id,
+                    "branch_id": branch_id,
+                    "message_id": parent_message_id,
+                },
+            )
+            if row:
+                return row
+        if parent_message_timestamp is not None:
+            return self._message_by_timestamp(
+                thread_id, branch_id, parent_message_timestamp
+            )
+        return None
+
     def _row_to_message_dict(self, row):
         dto = self.db.to_dto(row, MESSAGE_DTO_JSON_COLUMNS)
         message = {
@@ -153,20 +181,41 @@ class BranchService:
     def create_branch(
         self,
         thread_id: int,
-        parent_message_timestamp: int,
-        name: str,
+        parent_message_timestamp: Optional[int] = None,
+        name: str = "branch",
         copy_mode: str = "copy",
         user=None,
+        parent_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         self.db.ensure_thread_branches(thread_id, user=user)
         thread = self.db.get_thread(thread_id, user=user)
         if not thread:
             raise ValueError("Thread not found")
 
+        if parent_message_id is None and parent_message_timestamp is None:
+            raise ValueError("messageId or parentMessageId required")
+
         current_branch_id = thread["currentBranchId"]
-        parent_row = self._message_by_timestamp(thread_id, current_branch_id, parent_message_timestamp)
+        parent_row = self._resolve_parent_message(
+            thread_id,
+            current_branch_id,
+            parent_message_id=parent_message_id,
+            parent_message_timestamp=parent_message_timestamp,
+        )
+        if not parent_row:
+            messages = self.db._parse_thread_messages(thread.get("messages"))
+            if messages:
+                self.replace_branch_messages(thread_id, current_branch_id, messages, user=user)
+                parent_row = self._resolve_parent_message(
+                    thread_id,
+                    current_branch_id,
+                    parent_message_id=parent_message_id,
+                    parent_message_timestamp=parent_message_timestamp,
+                )
         if not parent_row:
             raise ValueError("Parent message not found on current branch")
+
+        up_to_timestamp = parent_row["timestamp"]
 
         copy_mode = (copy_mode or "copy").lower()
         if copy_mode not in ("copy", "reference"):
@@ -189,7 +238,7 @@ class BranchService:
                     thread_id,
                     current_branch_id,
                     new_branch_id,
-                    up_to_timestamp=parent_message_timestamp,
+                    up_to_timestamp=up_to_timestamp,
                 )
             else:
                 root_id = self._reference_messages_to_branch(
@@ -197,7 +246,7 @@ class BranchService:
                     thread_id,
                     current_branch_id,
                     new_branch_id,
-                    parent_message_timestamp,
+                    up_to_timestamp,
                 )
 
             if root_id:
@@ -206,19 +255,18 @@ class BranchService:
                     (root_id, new_branch_id),
                 )
 
-            conn.execute(
-                "UPDATE thread SET currentBranchId = ? WHERE id = ?",
-                (new_branch_id, thread_id),
-            )
             conn.commit()
 
+        self.db.update_thread(thread_id, {"currentBranchId": new_branch_id}, user=user)
         messages = self.db.get_branch_messages(new_branch_id, user=user)
+        row = self.db.get_thread(thread_id, user=user)
         return {
             "branchId": new_branch_id,
             "threadId": thread_id,
             "name": name,
             "copyMode": copy_mode,
             "messages": messages,
+            "updatedAt": row.get("updatedAt") if row else None,
         }
 
     def switch_branch(self, thread_id: int, branch_id: int, user=None) -> Dict[str, Any]:
@@ -234,13 +282,23 @@ class BranchService:
             user=user,
         )
         self.db.sync_main_branch_messages_json(thread_id, branch_id, messages, user=user)
-        return {"threadId": thread_id, "branchId": branch_id, "messages": messages}
+        row = self.db.get_thread(thread_id, user=user)
+        return {
+            "threadId": thread_id,
+            "branchId": branch_id,
+            "messages": messages,
+            "updatedAt": row.get("updatedAt") if row else None,
+        }
 
     def get_branch_tree(self, thread_id: int, user=None) -> Dict[str, Any]:
         self.db.ensure_thread_branches(thread_id, user=user)
         rows = self.db.db.all(
             """
-            SELECT b.*, (SELECT COUNT(*) FROM message m WHERE m.branchId = b.id) AS messageCount
+            SELECT b.*,
+                (
+                    (SELECT COUNT(*) FROM message m WHERE m.branchId = b.id)
+                    + (SELECT COUNT(DISTINCT mr.childMessageId) FROM message_relationship mr WHERE mr.branchId = b.id)
+                ) AS messageCount
             FROM branch b
             WHERE b.threadId = :thread_id AND b.isDeleted = 0
             ORDER BY b.id ASC
@@ -257,12 +315,23 @@ class BranchService:
                     tags = json.loads(tags)
                 except json.JSONDecodeError:
                     tags = []
+            root_message_timestamp = None
+            root_message_id = row.get("rootMessageId")
+            if root_message_id:
+                root_row = self.db.db.one(
+                    "SELECT timestamp FROM message WHERE id = :id",
+                    {"id": root_message_id},
+                )
+                if root_row:
+                    root_message_timestamp = root_row.get("timestamp")
+
             node = {
                 "id": row["id"],
                 "threadId": row["threadId"],
                 "name": row["name"],
                 "parentBranchId": row.get("parentBranchId"),
-                "rootMessageId": row.get("rootMessageId"),
+                "rootMessageId": root_message_id,
+                "rootMessageTimestamp": root_message_timestamp,
                 "createdAt": row.get("createdAt"),
                 "tags": tags or [],
                 "messageCount": row.get("messageCount") or 0,

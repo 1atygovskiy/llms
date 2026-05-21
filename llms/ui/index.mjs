@@ -41,16 +41,16 @@ export async function createContext() {
 
     // Load modules in parallel
     const validExtensions = ctx.state.extensions.filter(x => x.path);
-    ctx.modules = await Promise.all(validExtensions.map(async extension => {
+    ctx.modules = (await Promise.all(validExtensions.map(async extension => {
         try {
             const module = await import(extension.path)
             const order = module.default.order || 0
             return { extension, module, order }
         } catch (e) {
-            console.error(`Failed to load extension module ${extension.name}:`, e)
+            console.error(`Failed to load extension module ${extension.id}:`, e)
             return null
         }
-    }))
+    }))).filter(Boolean)
 
     // sort modules by order
     ctx.modules.sort((a, b) => a.order - b.order)

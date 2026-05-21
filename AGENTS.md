@@ -13,6 +13,13 @@ pip install -r requirements.txt
 npm install
 ```
 
+If the page loads blank, install vendored UI libraries (missing from some forks):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup-ui-libs.ps1
+npx tailwindcss -i ./llms/ui/tailwind.input.css -o ./llms/ui/app.css --minify
+```
+
 ## Run
 
 ```bash

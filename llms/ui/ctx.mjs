@@ -228,11 +228,11 @@ export class AppContext {
     }
     getUserAvatar() {
         const theme = this.getPrefs().theme || this.getColorScheme()
-        return this.resolveUrl(`/avatar/user?theme=${theme}&t=${this.state.cacheBreaker}`)
+        return this.resolveUrl(`/ext/app/avatar/user?theme=${theme}&t=${this.state.cacheBreaker}`)
     }
     getAgentAvatar() {
         const theme = this.getPrefs().theme || this.getColorScheme()
-        return this.resolveUrl(`/agents/avatar?theme=${theme}&t=${this.state.cacheBreaker}`)
+        return this.resolveUrl(`/ext/app/agents/avatar?theme=${theme}&t=${this.state.cacheBreaker}`)
     }
     incCacheBreaker() {
         this.state.cacheBreaker++

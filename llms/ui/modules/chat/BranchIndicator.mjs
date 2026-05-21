@@ -1,34 +1,59 @@
 import { computed, inject } from 'vue'
 
+function flattenBranches(nodes, depth = 0, out = []) {
+    for (const n of nodes || []) {
+        out.push({ ...n, depth })
+        flattenBranches(n.children, depth + 1, out)
+    }
+    return out
+}
+
 export const BranchIndicator = {
     template: `
-        <div v-if="branchName" class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs border"
-            :class="[$styles.muted, $styles.chromeBorder]"
-            :title="branchTitle">
-            <svg class="size-3.5 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M6 3v12"/><circle cx="6" cy="18" r="3"/><path d="M18 6v9"/><circle cx="18" cy="18" r="3"/>
-            </svg>
-            <span class="font-medium max-w-[10rem] truncate">{{ branchName }}</span>
-            <span v-if="isDirty" class="size-1.5 rounded-full bg-amber-500" title="Unsent changes"></span>
+        <div v-if="flatBranches.length" class="inline-flex items-center gap-2 flex-wrap">
+            <label class="sr-only">Current branch</label>
+            <select
+                :value="currentBranchId ?? ''"
+                @change="onBranchSelect"
+                class="text-xs rounded-md border px-2 py-1 max-w-[12rem] truncate"
+                :class="[$styles.chromeBorder, $styles.dropdownButton]"
+                :title="branchTitle"
+            >
+                <option v-for="b in flatBranches" :key="b.id" :value="b.id">
+                    {{ indent(b.depth) }}{{ b.name }} ({{ b.messageCount }})
+                </option>
+            </select>
+            <button type="button"
+                class="text-xs px-2 py-1 rounded-md border transition-colors"
+                :class="[$styles.chromeBorder, $styles.linkHover]"
+                title="Open branch list"
+                @click="openBranches">
+                Branches
+            </button>
+            <button type="button"
+                class="text-xs px-2 py-1 rounded-md border transition-colors"
+                :class="[$styles.chromeBorder, $styles.linkHover]"
+                title="Branch map"
+                @click="openBranchMap">
+                Map
+            </button>
+            <span v-if="isDirty" class="size-2 rounded-full bg-amber-500 shrink-0" title="Unsent changes"></span>
         </div>
     `,
     setup() {
+        const ctx = inject('ctx')
         const branches = globalThis.$branches
         const currentBranchId = branches?.currentBranchId
 
-        const branchName = computed(() => {
+        const flatBranches = computed(() => {
             const tree = branches?.currentBranchTree?.value
+            return flattenBranches(tree?.branches)
+        })
+
+        const branchTitle = computed(() => {
             const id = currentBranchId?.value
-            if (!tree || id == null) return null
-            const find = (nodes) => {
-                for (const n of nodes || []) {
-                    if (n.id === id) return n.name
-                    const c = find(n.children)
-                    if (c) return c
-                }
-                return null
-            }
-            return find(tree.branches) || 'main'
+            const b = flatBranches.value.find(x => x.id === id)
+            return b ? `${b.name} · ${b.messageCount} messages` : 'Branches'
         })
 
         const isDirty = computed(() => {
@@ -36,13 +61,38 @@ export const BranchIndicator = {
             return id != null && branches?.isDirty?.(id)
         })
 
-        const branchTitle = computed(() => {
-            const tags = []
-            if (isDirty.value) tags.push('unsent changes')
-            return tags.length ? `${branchName.value} (${tags.join(', ')})` : branchName.value
-        })
+        function indent(depth) {
+            return depth > 0 ? '— '.repeat(depth) : ''
+        }
 
-        return { branchName, isDirty, branchTitle }
+        async function onBranchSelect(e) {
+            const branchId = parseInt(e.target.value, 10)
+            const thread = ctx?.threads?.currentThread?.value
+            if (!thread || !branchId || branchId === currentBranchId?.value) return
+            await branches.switchBranch(thread.id, branchId, {
+                scrollContainer: document.getElementById('messages'),
+            })
+        }
+
+        function openBranches() {
+            branches?.showBranchPanel?.()
+        }
+
+        function openBranchMap() {
+            ctx.setLayout({ left: 'BranchTree' })
+            ctx.toggleLayout('left', true)
+        }
+
+        return {
+            flatBranches,
+            currentBranchId,
+            branchTitle,
+            isDirty,
+            indent,
+            onBranchSelect,
+            openBranches,
+            openBranchMap,
+        }
     },
 }
 

@@ -212,10 +212,8 @@ async function loadThreads() {
 }
 
 async function getThread(threadId) {
-    const cachedThread = threads.value.find(t => t.id == threadId)
-    if (cachedThread) return cachedThread
-    const api = await ext.getJson(`/threads?id=${threadId}`)
-    return api.response && api.response[0] || null
+    const api = await ext.getJson(`/threads/${threadId}`)
+    return api.response || null
 }
 
 // Delete thread
@@ -231,7 +229,7 @@ async function deleteThread(threadId) {
 
 // Set current thread
 async function setCurrentThread(threadId) {
-    const thread = await getThread(threadId)
+    const thread = await loadThreadDetails(threadId, { force: true })
     if (thread) {
         currentThread.value = thread
         if (globalThis.$branches) {
@@ -250,8 +248,7 @@ async function setCurrentThreadFromRoute(threadId, router) {
         return null
     }
 
-    loadThreadDetails(threadId)
-    const thread = setCurrentThread(threadId)
+    const thread = await setCurrentThread(threadId)
     if (thread) {
         return thread
     } else {

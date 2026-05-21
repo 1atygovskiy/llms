@@ -348,7 +348,7 @@ export default {
     },
 
     async load(ctx) {
-        const api = await ctx.getJson("/themes")
+        const api = await ext.getJson("/themes")
         if (api.response) {
             ctx.setState({
                 themes: api.response

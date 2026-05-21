@@ -2341,7 +2341,8 @@ def print_status():
 
 
 def home_llms_path(filename):
-    home_dir = os.getenv("LLMS_HOME", os.path.join(os.getenv("HOME"), ".llms"))
+    base = os.getenv("HOME") or os.getenv("USERPROFILE") or os.path.expanduser("~")
+    home_dir = os.getenv("LLMS_HOME", os.path.join(base, ".llms"))
     relative_path = os.path.join(home_dir, filename)
     # return resolved full absolute path
     return os.path.abspath(os.path.normpath(relative_path))
@@ -3148,6 +3149,12 @@ def handler_name(handler):
     return "unknown"
 
 
+def join_url_path(*parts: str) -> str:
+    """Join URL path segments with forward slashes (os.path.join breaks routes on Windows)."""
+    segments = [part.strip("/") for part in parts if part]
+    return "/" + "/".join(segments) if segments else "/"
+
+
 class ExtensionContext:
     def __init__(self, app: AppExtensions, path: str):
         self.app = app
@@ -3297,7 +3304,7 @@ class ExtensionContext:
         self.app.all_providers.append(provider)
 
     def register_ui_extension(self, index: str):
-        path = os.path.join(self.ext_prefix, index)
+        path = join_url_path(self.ext_prefix, index)
         self.log(f"Registered UI extension: {path}")
         self.app.ui_extensions.append({"id": self.name, "path": path})
 
@@ -3335,10 +3342,10 @@ class ExtensionContext:
                 return web.FileResponse(file_path)
             return web.Response(status=404)
 
-        self.app.server_add_get.append((os.path.join(self.ext_prefix, "{path:.*}"), serve_static, {}))
+        self.app.server_add_get.append((join_url_path(self.ext_prefix, "{path:.*}"), serve_static, {}))
 
     def web_path(self, method: str, path: str) -> str:
-        full_path = os.path.join(self.ext_prefix, path) if path else self.ext_prefix
+        full_path = join_url_path(self.ext_prefix, path) if path else self.ext_prefix
         self.dbg(f"Registered {method:<6} {full_path}")
         return full_path
 
@@ -3660,6 +3667,8 @@ def install_extensions():
                 ctx = ExtensionContext(g_app, item_path)
                 module = None
                 init_file = os.path.join(item_path, "__init__.py")
+                ui_path = os.path.join(item_path, "ui")
+
                 if os.path.exists(init_file):
                     spec = importlib.util.spec_from_file_location(item, init_file)
                     if spec and spec.loader:
@@ -3682,12 +3691,8 @@ def install_extensions():
                     _log(f"Extension {item} was disabled")
                     continue
 
-                # if ui folder exists, serve as static files at /ext/{item}/
-                ui_path = os.path.join(item_path, "ui")
                 if os.path.exists(ui_path):
                     ctx.add_static_files(ui_path)
-
-                # Register UI extension if index.mjs exists (/ext/{item}/index.mjs)
                 if os.path.exists(os.path.join(ui_path, "index.mjs")):
                     ctx.register_ui_extension("index.mjs")
 
@@ -4636,7 +4641,13 @@ def cli_exec(cli_args, extra_args):
         app.router.add_get("/", index_handler)
 
         # Serve index.html as fallback route (SPA routing)
-        app.router.add_route("*", "/{tail:.*}", index_handler)
+        async def spa_fallback_handler(request):
+            path = request.path
+            if path.startswith("/ext/") or path.startswith("/ui/"):
+                return web.Response(text="404: Not Found", status=404)
+            return await index_handler(request)
+
+        app.router.add_route("*", "/{tail:.*}", spa_fallback_handler)
 
         # Setup file watcher for config files
         async def start_background_tasks(app):

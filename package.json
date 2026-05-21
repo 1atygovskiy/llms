@@ -1,8 +1,8 @@
 {
     "scripts": {
         "test": "python -m unittest discover -s tests -p 'test_*.py'",
-        "ui:dev": "tailwindcss -i ./llms/ui/tailwind.input.css -o ./llms/ui/app.css --watch",
-        "ui:build": "tailwindcss -i ./llms/ui/tailwind.input.css -o ./llms/ui/app.css --minify",
+        "ui:dev": "npx @tailwindcss/cli -i ./llms/ui/tailwind.input.css -o ./llms/ui/app.css --watch",
+        "ui:build": "npx @tailwindcss/cli -i ./llms/ui/tailwind.input.css -o ./llms/ui/app.css --minify",
         "build": "python publish.py --build --prod",
         "version": "python -c \"from publish import get_current_version; print(get_current_version())\"",
         "bump": "python publish.py --bump",
@@ -12,5 +12,8 @@
         "lint:fix:unsafe": "ruff check --fix --unsafe-fixes .",
         "format": "ruff format .",
         "format:check": "ruff format --check ."
+    },
+    "devDependencies": {
+        "tailwindcss": "^4.3.0"
     }
 }

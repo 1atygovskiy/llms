@@ -8,6 +8,7 @@ const branchesTree = ref({})
 const dirtyBranches = ref(new Set())
 const branchScrollPositions = new Map()
 const lastDiff = ref(null)
+const compareDraft = ref({ branchA: null, branchB: null })
 
 let ctx = null
 let ext = null
@@ -45,6 +46,20 @@ function handleChannelMessage(event) {
             }
             break
         case 'branch:create':
+            if (currentBranchId.value !== payload.branchId) {
+                currentBranchId.value = payload.branchId
+            }
+            if (ctx?.threads?.currentThread?.value?.id === payload.threadId && payload.messages) {
+                const t = ctx.threads.currentThread.value
+                ctx.threads.replaceThread({
+                    ...t,
+                    messages: payload.messages,
+                    currentBranchId: payload.branchId,
+                    updatedAt: payload.updatedAt ?? t?.updatedAt,
+                })
+            }
+            loadBranchTree(payload.threadId)
+            break
         case 'branch:updated':
             loadBranchTree(payload.threadId)
             break
@@ -83,6 +98,12 @@ function restoreScrollPosition(threadId, branchId, container) {
     if (!container) return
     const top = getScrollPosition(threadId, branchId)
     container.scrollTop = top
+}
+
+function showBranchPanel() {
+    if (!ctx) return
+    ctx.setLayout({ left: 'BranchPanel' })
+    ctx.toggleLayout('left', true)
 }
 
 async function loadBranchTree(threadId) {
@@ -160,6 +181,7 @@ async function switchBranch(threadId, branchId, { scrollContainer = null } = {})
         ...thread,
         messages: api.response.messages,
         currentBranchId: branchId,
+        updatedAt: api.response.updatedAt ?? thread?.updatedAt,
     }
     ctx.threads.replaceThread(updated)
 
@@ -178,27 +200,47 @@ async function switchBranch(threadId, branchId, { scrollContainer = null } = {})
     return api.response
 }
 
-async function createBranch({ threadId, parentMessageId, name, copyMode = 'copy' }) {
-    const api = await ext.postJson('/branches/create', {
-        body: JSON.stringify({
-            threadId,
-            parentMessageId,
-            name,
-            copyMode,
-        }),
-    })
+function flattenBranchTree(tree) {
+    const out = []
+    const walk = (nodes, depth = 0) => {
+        for (const n of nodes || []) {
+            out.push({ ...n, depth })
+            walk(n.children, depth + 1)
+        }
+    }
+    walk(tree?.branches)
+    return out
+}
+
+function isDefaultMainBranch(node) {
+    return node?.name === 'main' && (node?.tags || []).includes('__default__')
+}
+
+async function createBranch({ threadId, parentMessageId, messageId, name, copyMode = 'copy' }) {
+    const body = { threadId, name, copyMode }
+    if (messageId != null) body.messageId = messageId
+    else if (parentMessageId != null) body.parentMessageId = parentMessageId
+    const api = await ext.postJson('/branches/create', body)
     if (!api.response) {
         setError(api.error, 'Creating branch')
         return null
     }
     currentBranchId.value = api.response.branchId
+    const thread = ctx.threads.currentThread.value
     ctx.threads.replaceThread({
-        ...ctx.threads.currentThread.value,
+        ...thread,
         messages: api.response.messages,
         currentBranchId: api.response.branchId,
+        updatedAt: api.response.updatedAt ?? thread?.updatedAt,
     })
-    publish('branch:create', { threadId, branchId: api.response.branchId })
+    publish('branch:create', {
+        threadId,
+        branchId: api.response.branchId,
+        messages: api.response.messages,
+        updatedAt: api.response.updatedAt ?? thread?.updatedAt,
+    })
     await loadBranchTree(threadId)
+    showBranchPanel()
     return api.response
 }
 
@@ -227,9 +269,7 @@ async function deleteBranch(branchId) {
 }
 
 async function mergeBranches(sourceBranchId, targetBranchId) {
-    const api = await ext.postJson('/branches/merge', {
-        body: JSON.stringify({ sourceBranchId, targetBranchId }),
-    })
+    const api = await ext.postJson('/branches/merge', { sourceBranchId, targetBranchId })
     if (!api.response) {
         setError(api.error, 'Merging branches')
         return null
@@ -269,9 +309,7 @@ async function renameBranch(branchId, name) {
 }
 
 async function updateTags(branchId, add = [], remove = []) {
-    const api = await ext.postJson('/branches/tags', {
-        body: JSON.stringify({ branchId, add, remove }),
-    })
+    const api = await ext.postJson('/branches/tags', { branchId, add, remove })
     if (!api.response) {
         setError(api.error, 'Updating branch tags')
         return null
@@ -287,9 +325,7 @@ async function searchBranches(q, take = 50) {
 }
 
 async function forkThread(threadId, branchId = null) {
-    const api = await ext.postJson(`/branches/fork/${threadId}`, {
-        body: JSON.stringify(branchId ? { branchId } : {}),
-    })
+    const api = await ext.postJson(`/branches/fork/${threadId}`, branchId ? { branchId } : {})
     if (!api.response) {
         setError(api.error, 'Forking thread')
         return null
@@ -303,14 +339,61 @@ async function exportBranch(branchId) {
 }
 
 async function importBranch(payload, threadId = null) {
-    const api = await ext.postJson('/branches/import', {
-        body: JSON.stringify({ ...payload, threadId }),
-    })
+    const api = await ext.postJson('/branches/import', { ...payload, threadId })
     if (!api.response) {
         setError(api.error, 'Importing branch')
         return null
     }
+    const tid = threadId ?? ctx?.threads?.currentThread?.value?.id
+    if (tid) {
+        await loadBranchTree(tid)
+        if (api.response.branchId) {
+            await switchBranch(tid, api.response.branchId)
+        }
+    }
     return api.response
+}
+
+function openBranchCompare(branchA = null, branchB = null) {
+    compareDraft.value = {
+        branchA: branchA ?? currentBranchId.value,
+        branchB: branchB ?? null,
+    }
+    ctx?.openModal?.('BranchCompare')
+}
+
+async function runBranchCompare(branchA, branchB) {
+    if (branchA == null || branchB == null || branchA === branchB) {
+        ctx?.toast?.('Select two different branches')
+        return null
+    }
+    const diff = await getBranchDiff(branchA, branchB)
+    if (diff) {
+        ctx?.closeModal?.('BranchCompare')
+        ctx?.openModal?.('DiffViewer')
+    }
+    return diff
+}
+
+async function downloadBranchExport(branchId) {
+    const data = await exportBranch(branchId)
+    if (!data) return null
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `branch-${branchId}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    ctx?.toast?.('Branch exported')
+    return data
+}
+
+async function importBranchFromFile(file, threadId = null) {
+    if (!file) return null
+    const text = await file.text()
+    const payload = JSON.parse(text)
+    return importBranch(payload, threadId)
 }
 
 function rewindToBranchRoot(scrollContainer = null) {
@@ -328,10 +411,10 @@ function rewindToBranchRoot(scrollContainer = null) {
     }
 
     const branch = findBranch(tree.branches, currentBranchId.value)
-    const rootTs = branch?.rootMessageId
+    const rootTs = branch?.rootMessageTimestamp ?? branch?.rootMessageId
     if (!scrollContainer) return
 
-    if (rootTs) {
+    if (rootTs != null) {
         const el = scrollContainer.querySelector(`[data-message-id="${rootTs}"]`)
             || scrollContainer.querySelector(`[data-timestamp="${rootTs}"]`)
         if (el) {
@@ -353,7 +436,10 @@ export function useBranchStore() {
         branchesTree,
         dirtyBranches,
         lastDiff,
+        compareDraft,
         currentBranchTree,
+        flattenBranchTree,
+        isDefaultMainBranch,
         loadBranchTree,
         switchBranch,
         createBranch,
@@ -366,12 +452,17 @@ export function useBranchStore() {
         forkThread,
         exportBranch,
         importBranch,
+        openBranchCompare,
+        runBranchCompare,
+        downloadBranchExport,
+        importBranchFromFile,
         markDirty,
         clearDirty,
         isDirty,
         saveScrollPosition,
         restoreScrollPosition,
         rewindToBranchRoot,
+        showBranchPanel,
     }
 }
 
@@ -380,6 +471,12 @@ export default {
         ctx = context
         ext = ctx.scope('app')
         initChannel()
-        ctx.setGlobals({ branches: useBranchStore() })
+        const store = useBranchStore()
+        ctx.setGlobals({ branches: store })
+        ctx.setState({
+            currentBranchId: store.currentBranchId,
+            branchesTree: store.branchesTree,
+            dirtyBranches: store.dirtyBranches,
+        })
     },
 }

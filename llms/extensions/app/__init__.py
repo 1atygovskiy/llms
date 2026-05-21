@@ -808,6 +808,11 @@ def install(ctx):
                 "metadata": metadata,
             }
             await g_db.update_thread_async(thread_id, update_thread, user=user)
+            g_db.ensure_thread_branches(thread_id, user=user)
+            thread_row = g_db.get_thread(thread_id, user=user)
+            branch_id = thread_row.get("currentBranchId") if thread_row else None
+            if branch_id:
+                g_branches.replace_branch_messages(thread_id, branch_id, messages, user=user)
 
         completed_at = g_db.get_thread_column(thread_id, "completedAt", user=user)
         if completed_at:
@@ -832,6 +837,11 @@ def install(ctx):
             },
             user=user,
         )
+        g_db.ensure_thread_branches(thread_id, user=user)
+        thread_row = g_db.get_thread(thread_id, user=user)
+        branch_id = thread_row.get("currentBranchId") if thread_row else None
+        if branch_id:
+            g_branches.replace_branch_messages(thread_id, branch_id, messages, user=user)
 
         completed_at = g_db.get_thread_column(thread_id, "completedAt", user=user)
         if completed_at:
@@ -1046,12 +1056,20 @@ def install(ctx):
     async def branch_create(request):
         body = await request.json()
         user = ctx.get_username(request)
+        message_id = body.get("messageId")
+        parent_ts = body.get("parentMessageId")
+        if message_id is None and parent_ts is None:
+            return web.json_response(
+                {"error": "messageId or parentMessageId required"},
+                status=400,
+            )
         result = g_branches.create_branch(
-            thread_id=int(body["threadId"]),
-            parent_message_timestamp=int(body["parentMessageId"]),
-            name=body.get("name", "branch"),
-            copy_mode=body.get("copyMode", "copy"),
-            user=user,
+            int(body["threadId"]),
+            int(parent_ts) if parent_ts is not None else None,
+            body.get("name", "branch"),
+            body.get("copyMode", "copy"),
+            user,
+            parent_message_id=int(message_id) if message_id is not None else None,
         )
         return web.json_response(result)
 
@@ -1060,8 +1078,6 @@ def install(ctx):
     async def branch_switch(request):
         body = await request.json()
         user = ctx.get_username(request)
-        if g_branches.check_thread_conflict(int(body["threadId"]), body.get("updatedAt"), user=user):
-            return conflict_response()
         result = g_branches.switch_branch(
             thread_id=int(body["threadId"]),
             branch_id=int(body["branchId"]),
@@ -1163,11 +1179,13 @@ def install(ctx):
     ctx.add_get("branches/search", branch_search)
 
     async def branch_rename(request):
+        branch_id = int(request.match_info["branch_id"])
         body = await request.json()
         user = ctx.get_username(request)
-        return web.json_response(
-            g_branches.rename_branch(int(body["branchId"]), body["name"], user=user)
-        )
+        name = body.get("name")
+        if not name:
+            return web.json_response({"error": "name required"}, status=400)
+        return web.json_response(g_branches.rename_branch(branch_id, name, user=user))
 
     ctx.add_patch("branches/{branch_id}", branch_rename)
 
